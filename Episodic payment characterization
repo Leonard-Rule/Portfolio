@@ -1,0 +1,86 @@
+Three initial Criteria to group members into one of three epiosde start types. 
+--2.) Members who had a PT evaluation claim during this time frame
+DROP TABLE sandbox.vbc_truven_lr_tmp_PT_Eps
+SELECT DISTINCT memberid,svcdate,dx1,dx2,dx3,dx4,proc1,year,age,pay,region,sex 
+INTO sandbox.vbc_truven_lr_tmp_PT_Eps 
+FROM sandbox.vbc_truven_lr_proc_all  
+WHERE proc1 in ('97161','97162','97163')
+
+--3.) Members who had shoulder surgeries during this time frame
+SELECT DISTINCT memberid,svcdate,year,age,sum(pay) as pay,dx1,dx2,dx3,dx4,proc1,Category3,short,long,region,sex
+INTO vbc_lr_surg 
+FROM vbc_truven_lr_proc_all a 
+LEFT JOIN rdb.cptcodedescriptions b
+ON a.proc1=b.codevalue
+WHERE proc1 in (SELECT CodeValue
+				FROM rdb.cptcodedescriptions
+				WHERE category2 ='Surgical Procedures on the Musculoskeletal System'
+				--AND category3 NOT LIKE '%Endoscopy/Athroscopy%' Do we want to add this in?
+				AND category3 NOT LIKE '%General%'
+				AND category4 NOT LIKE '%Amputation%' 
+				AND category4 NOT LIKE '%Application of casts%'
+				AND category4 NOT LIKE '%Incision%'
+				AND category4 NOT LIKE '%Excision%'
+				AND category4 NOT LIKE '%Graft%'
+				AND category4 NOT LIKE '%Other%'		
+				AND category4 NOT LIKE '%Wound exploration%') 
+				AND memberid IN (SELECT DISTINCT memberid 
+								FROM sandbox.vbc_truven_lr_tmp_PT_Eps) 
+GROUP BY memberid,svcdate,year,age,dx1,dx2,dx3,dx4,proc1,Category3,short,long,region,sex
+
+--4.) Create third table that includes any gaps between non-eval PT visits of 90 days or more
+ SELECT DISTINCT memberid,svcdate,year,age,sum(pay) as pay,dx1,dx2,dx3,dx4,proc1,category,region
+ INTO sandbox.vbc_caregap
+ FROM 
+ (SELECT DISTINCT memberid,svcdate,year,age,sum(pay) as pay,dx1,dx2,dx3,dx4,proc1,region
+ ,CASE WHEN DATEDIFF (day, lag(svcdate) OVER (PARTITION BY memberid ORDER BY svcdate), svcdate) >=90
+		AND proc1 IN ('29105', '29125','29126','29130','29131'-- main PT visit codes)  
+		AND memberid IN (SELECT DISTINCT memberid 
+								FROM sandbox.vbc_truven_lr_tmp_PT_Eps)
+			   THEN  'GAP'
+			   ELSE NULL
+			   END AS Category
+ FROM sandbox.vbc_truven_lr_proc_all
+ WHERE proc1 IN ('97161','97162','97163'--Initial eval codes
+                   '29105', '29125','29126','29130','29131'-- main PT visit codes) 
+GROUP BY memberid,svcdate,year,age,dx1,dx2,dx3,dx4,proc1,region
+) Sub
+WHERE Category = 'GAP'
+GROUP BY memberid,svcdate,year,age,dx1,dx2,dx3,dx4,proc1,category,region
+
+ Assign type of pain to possible episode start dates that are on the same day. Also, calculate lag and lead days between possible episode start dates.
+DROP TABLE #truven_PT_lead_lag
+SELECT DISTINCT 
+category,memberid,proc1,pay,start_date as start_date, dx1,dx2,dx3,dx4, region,
+CASE WHEN pain IS NULL THEN (SELECT TOP 1 paintable.pain 
+							FROM #vbc_pain_cat AS paintable
+							WHERE paintable.memberid=#vbc_pain_cat.memberid
+							AND paintable.start_date >= (#vbc_pain_cat.start_date) 
+							AND paintable.start_date <= DATEADD(day,30,#vbc_pain_cat.start_date) --Searches for pain dx 30 days ahead of current date to catch more. 
+							AND paintable.pain IS NOT NULL
+							ORDER BY paintable.memberid, paintable.start_date, paintable.pain DESC)
+	ELSE pain
+	END AS Pain,
+datediff(day,lag(start_date,1) OVER (PARTITION BY memberid ORDER BY start_date, category ASC),start_date) AS PT_lag,
+datediff(day, start_date,lead(start_date,1) OVER (PARTITION BY memberid ORDER BY start_date)) AS PT_lead
+INTO #truven_PT_lead_lag
+FROM #vbc_pain_cat
+GROUP BY category,memberid,proc1,pay,start_date, dx1, dx2, dx3,dx4, pain,region
+
+--7.)Select proper start date based of epsiode triggering criteria and use that as episode start date (start here on MON)
+DROP TABLE #truven_PT_episodes_begin
+SELECT DISTINCT category,memberid,proc1,pay,start_date, pain, region,
+MAX(PT_lag) AS PT_lag, 
+ROW_NUMBER() OVER (PARTITION BY memberid ORDER BY start_date) AS PT_rank, epi_start 
+INTO #truven_PT_episodes_begin
+FROM (SELECT *,
+CASE WHEN PT_lag IS NULL THEN start_date
+	 WHEN category='Evaluation Code' AND PT_lag >90 AND PT_lead !=0 THEN start_date
+	 WHEN category='Surgery Code' AND LAG(Category) OVER (PARTITION BY memberid ORDER BY start_date, PT_lag DESC) != 'Surgery Code' THEN start_date
+	 --WHEN category='Surgery Code' AND LAG(Category) OVER (PARTITION BY memberid ORDER BY start_date, PT_lag DESC) = 'Evaluation Code' AND PT_lag >=30 THEN start_date
+	 WHEN category='Gap' AND PT_lag > 90  AND (PT_lead > 0 OR PT_lead IS NULL ) THEN start_date
+	 ELSE NULL
+	 END AS epi_start
+FROM #truven_PT_lead_lag) sub
+WHERE epi_start IS NOT NULL
+GROUP BY category,memberid,proc1,pay,start_date, pain, Pt_lag, Pt_lead, epi_start,region
