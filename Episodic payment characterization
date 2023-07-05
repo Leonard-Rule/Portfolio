@@ -1,61 +1,62 @@
-Goal: Categorize claims data into physical therapy episodes.
-Three criteria were used to group members into epiosdes.
-SQL skills utilized: CASE WHEN statemtns, JOIN, UNION, Window functions (LAG, PARTITION BY, ROW_NUMBER), subqueries
+Goal: Categorize claims data into physical therapy episodes and calculate average number of visits and average cost per episode. 
+
+Methedology: One of three events triggered the start of a physical therapy episode. Each episode was labeled based on pain type and the event that started the episode. Then, each visit that occured during that episode was filled in accordingly.
+
+SQL skills utilized: CASE WHEN statemetns, JOINs, UNION, Window functions (LAG, PARTITION BY, ROW_NUMBER), subqueries, temp tables, STRING functions, COALESCE, DATE calculations 
 
 --1.) Create patient universe: All patients who had a PT evaluation claim during this time frame.
 
 SELECT DISTINCT memberid,svcdate,dx1,dx2,dx3,dx4,proc1,year,age,pay,region,sex 
-INTO sandbox.vbc_truven_lr_tmp_PT_Eps 
-FROM sandbox.vbc_truven_lr_proc_all  
+INTO truven_lr_tmp_PT_Eps 
+FROM truven_lr_proc_all  
 WHERE proc1 in ('97161','97162','97163')
 
 --2.) Identify members who had surgeries that would signifcantly affect their physical therapy care during this time frame.
 
 SELECT DISTINCT memberid,svcdate,year,age,sum(pay) as pay,dx1,dx2,dx3,dx4,proc1,Category3,short,long,region,sex
 INTO vbc_lr_surg 
-FROM vbc_truven_lr_proc_all a 
-LEFT JOIN rdb.cptcodedescriptions b
-ON a.proc1=b.codevalue
+FROM vbc_truven_lr_proc_all all 
+LEFT JOIN cptcodedescriptions desc
+ON all.proc1=desc.codevalue
 WHERE proc1 in (SELECT CodeValue
-				FROM rdb.cptcodedescriptions
-				WHERE category2 ='Surgical Procedures on the Musculoskeletal System'
-				--AND category3 NOT LIKE '%Endoscopy/Athroscopy%' Do we want to add this in?
-				AND category3 NOT LIKE '%General%'
-				AND category4 NOT LIKE '%Amputation%' 
-				AND category4 NOT LIKE '%Application of casts%'
-				AND category4 NOT LIKE '%Incision%'
-				AND category4 NOT LIKE '%Excision%'
-				AND category4 NOT LIKE '%Graft%'
-				AND category4 NOT LIKE '%Other%'		
-				AND category4 NOT LIKE '%Wound exploration%') 
-				AND memberid IN (SELECT DISTINCT memberid 
-								FROM sandbox.vbc_truven_lr_tmp_PT_Eps) 
+		FROM rdb.cptcodedescriptions
+		WHERE category2 ='Surgical Procedures on the Musculoskeletal System'
+			AND category3 NOT LIKE '%General%'
+			AND category4 NOT LIKE '%Amputation%' 
+			AND category4 NOT LIKE '%Application of casts%'
+			AND category4 NOT LIKE '%Incision%'
+			AND category4 NOT LIKE '%Excision%'
+			AND category4 NOT LIKE '%Graft%'
+			AND category4 NOT LIKE '%Other%'		
+			AND category4 NOT LIKE '%Wound exploration%') 
+			AND memberid IN (SELECT DISTINCT memberid 
+		FROM sandbox.vbc_truven_lr_tmp_PT_Eps) 
 GROUP BY memberid,svcdate,year,age,dx1,dx2,dx3,dx4,proc1,Category3,short,long,region,sex
 
---3.) Identify 90 day gap or more between non-evaluation PT visits.
+--3.) Identify 90 day or more gap between non-evaluation PT visits.
 
  SELECT DISTINCT memberid,svcdate,year,age,sum(pay) as pay,dx1,dx2,dx3,dx4,proc1,category,region
  INTO sandbox.vbc_caregap
  FROM 
- (SELECT DISTINCT memberid,svcdate,year,age,sum(pay) as pay,dx1,dx2,dx3,dx4,proc1,region
- ,CASE WHEN DATEDIFF (day, lag(svcdate) OVER (PARTITION BY memberid ORDER BY svcdate), svcdate) >=90
+ (
+	SELECT DISTINCT memberid,svcdate,year,age,sum(pay) as pay,dx1,dx2,dx3,dx4,proc1,region
+       ,CASE WHEN DATEDIFF (day, lag(svcdate) OVER (PARTITION BY memberid ORDER BY svcdate), svcdate) >=90
 		AND proc1 IN ('29105', '29125','29126','29130','29131'-- main PT visit codes)  
-		AND memberid IN (SELECT DISTINCT memberid 
-								FROM sandbox.vbc_truven_lr_tmp_PT_Eps)
-			   THEN  'GAP'
-			   ELSE NULL
-			   END AS Category
- FROM sandbox.vbc_truven_lr_proc_all
- WHERE proc1 IN ('97161','97162','97163'--Initial eval codes
+			AND memberid IN (SELECT DISTINCT memberid FROM sandbox.vbc_truven_lr_tmp_PT_Eps)
+		THEN  'GAP'
+		ELSE NULL
+		END AS Category
+ 	FROM sandbox.vbc_truven_lr_proc_all
+ 	WHERE proc1 IN ('97161','97162','97163'--Initial eval codes
                    '29105', '29125','29126','29130','29131'-- main PT visit codes) 
-GROUP BY memberid,svcdate,year,age,dx1,dx2,dx3,dx4,proc1,region
-) Sub
+	GROUP BY memberid,svcdate,year,age,dx1,dx2,dx3,dx4,proc1,region
+  ) gap
 WHERE Category = 'GAP'
 GROUP BY memberid,svcdate,year,age,dx1,dx2,dx3,dx4,proc1,category,region
 
 --4.) Combine three initial tables. This is a table of all possible episode start dates that includes a label of what type of episode it is.
 
-SELECT a.*
+SELECT all.*
 INTO sandbox.vbc_lr_all 
 FROM
 (
@@ -67,30 +68,45 @@ FROM sandbox.vbc_lr_surg
 UNION ALL
 SELECT DISTINCT 'Gap' as Category,memberid,svcdate,year,age,pay,dx1,dx2,dx3,dx4,proc1,region
 	FROM sandbox.vbc_caregap
-)a
+) all
 
- --5.) Assign type of pain to possible episode start dates that are on the same day. Also, calculate lag and lead days between possible episode start dates.
+--5.) Assign type of pain to possible episode start dates 
+
+SELECT DISTINCT category,memberid,proc1,pay,svcdate as start_date, dx1,dx2,dx3,dx4,region,
+CASE WHEN Substring(dx1,1,5) ='M2551' OR Substring(dx2,1,5) ='M2551' OR Substring(dx3,1,5) ='M2551' OR Substring(dx4,1,5) ='M2551' THEN 'Shoulder' 
+     WHEN Substring(dx1,1,5) ='M2552' OR Substring(dx2,1,5) ='M2552' OR Substring(dx3,1,5) ='M2552' OR Substring(dx4,1,5) ='M2552' THEN 'Elbow'
+     WHEN Substring(dx1,1,5) ='M2553' OR Substring(dx2,1,5) ='M2553' OR Substring(dx3,1,5) ='M2553' OR Substring(dx4,1,5) ='M2553' THEN 'Wrist'
+     ELSE NULL
+     END as Pain
+INTO #vbc_pain_cat
+FROM sandbox.vbc_lr_all 
+GROUP BY category,memberid,proc1,pay,svcdate, dx1, dx2, dx3,dx4,region
+
+ --6.) Fill in type of pain for episodes that have more than one possible starts start dates. Also, calculate lag and lead days between possible episode start dates so the proper label can be used.
 
 SELECT DISTINCT 
 category,memberid,proc1,pay,start_date as start_date, dx1,dx2,dx3,dx4, region,
 CASE WHEN pain IS NULL THEN 
-	(SELECT TOP 1 paintable.pain 
+	(
+	 SELECT TOP 1 paintable.pain 
 	 FROM #vbc_pain_cat AS paintable
 	 WHERE paintable.memberid=#vbc_pain_cat.memberid
 	 AND paintable.start_date >= (#vbc_pain_cat.start_date) 
-	 AND paintable.start_date <= DATEADD(day,30,#vbc_pain_cat.start_date) --Searches for pain dx 30 days ahead of current date to catch more. 
+	 AND paintable.start_date <= DATEADD(day,30,#vbc_pain_cat.start_date) --Selects pain dx up to 30 days ahead of current date so that more episodes are categorized correctly. 
 	 AND paintable.pain IS NOT NULL
-	 ORDER BY paintable.memberid, paintable.start_date, paintable.pain DESC)
- ELSE pain
+	 ORDER BY paintable.memberid, paintable.start_date, paintable.pain DESC
+        )
+ELSE pain
 END AS Pain,
 datediff(day,lag(start_date,1) OVER (PARTITION BY memberid ORDER BY start_date, category ASC),start_date) AS PT_lag,
 datediff(day, start_date,lead(start_date,1) OVER (PARTITION BY memberid ORDER BY start_date)) AS PT_lead
-INTO #truven_PT_lead_lag
+INTO truven_PT_lead_lag
 FROM #vbc_pain_cat
 GROUP BY category,memberid,proc1,pay,start_date, dx1, dx2, dx3,dx4, pain,region
 
---6.)Select proper start date based of epsiode triggering criteria and use that as episode start date (start here on MON)
-DROP TABLE #truven_PT_episodes_begin
+--7.)Select proper start date based of epsiode triggering criteria.
+
+
 SELECT DISTINCT category,memberid,proc1,pay,start_date, pain, region,
 MAX(PT_lag) AS PT_lag, 
 ROW_NUMBER() OVER (PARTITION BY memberid ORDER BY start_date) AS PT_rank, epi_start 
@@ -106,3 +122,152 @@ CASE WHEN PT_lag IS NULL THEN start_date
 FROM #truven_PT_lead_lag) sub
 WHERE epi_start IS NOT NULL
 GROUP BY category,memberid,proc1,pay,start_date, pain, Pt_lag, Pt_lead, epi_start,region
+
+--7b.)Calculate epsiode end date, subtract one day from the next epsiode start or add one year
+
+SELECT DISTINCT
+category,memberid,proc1,pain, COALESCE(DATEADD(day, -1, LEAD(start_date) OVER (PARTITION BY memberid ORDER BY start_date)), DATEADD(year,1,start_date)) as end_date,
+row_number() OVER (PARTITION BY memberid ORDER BY start_date) AS PT_rank
+INTO #truven_PT_episodes_end
+FROM #truven_PT_episodes_begin 
+GROUP BY category,memberid,proc1,start_date, pain
+
+--7c.) Combine start and end dates into one table. At this point we have all epsiode starts, labeled with type of pain and what triggered the episode. 
+
+SELECT DISTINCT 
+a.category,
+a.memberid,a.proc1,a.PT_rank AS PT_ep_id,pay,a.pain,
+a.start_date AS PT_ep_start,
+b.end_date AS PT_ep_end
+INTO sandbox.lr_truven_PT_episodes
+FROM #truven_PT_episodes_begin		a
+LEFT JOIN #truven_PT_episodes_end	b
+ON a.memberid = b.memberid AND  a.PT_rank = b.PT_rank
+and a.category=b.category
+GROUP BY a.category,a.memberid,a.proc1,pay,a.PT_rank,a.start_date,a.pain,b.end_date
+
+--8.)Join in epsiode start and end dates, and assign episodeid to each episode start. LR 5/17: Added in dxs here 
+
+SELECT DISTINCT a.memberid,svcdate,year,age,b.pain
+,a.proc1,sum(a.pay) as pay,a.category, dx1,dx2,dx3,dx4, a.region, 
+b.pt_ep_id,pt_ep_start,pt_ep_end
+INTO sandbox.vbc_tmp_lr_truven_1 
+FROM sandbox.vbc_lr_all  a 
+INNER JOIN sandbox.lr_truven_PT_episodes b
+ON a.memberid=b.memberid AND a.svcdate=b.pt_ep_start 
+AND a.category=b.category
+AND a.proc1=b.proc1 AND a.pay=b.pay
+GROUP BY  a.memberid,svcdate,year,age,a.proc1,a.category,dx1,dx2,dx3,dx4,a.region,
+b.pt_ep_id,pt_ep_start,pt_ep_end, b.pain
+
+--9.)Fill in all claims under each episode
+
+SELECT a.*, 
+--case when a.memberid=b.memberid and a.svcdate=b.pt_ep_start then max(shoulder_pain_flag)
+max(case when a.memberid=b.memberid and a.svcdate=b.pt_ep_start then b.pain end) as pain_ep,
+--max(case when a.memberid=b.memberid and a.svcdate=b.pt_ep_start then onc_diagnosis end) as onc_diagnosis,
+max(case when a.memberid=b.memberid and a.svcdate=b.pt_ep_start then b.category end) as category,
+max(case when a.memberid=b.memberid and a.svcdate=b.pt_ep_start then b.pt_ep_id end) as pt_ep_id,
+c.category3,
+max(case when a.memberid=b.memberid and a.svcdate=b.pt_ep_start then b.pt_ep_start end) as pt_ep_start
+--max(case when a.memberid=b.memberid and a.svcdate=b.pt_ep_end then pt_ep_end end) as pt_ep_end
+INTO sandbox.vbc_tmp_lr_truven_2
+FROM
+(
+select a.memberid,a.svcdate,a.year,age, proc1,region,sex,dx1,dx2,dx3,dx4,
+--max(case when x_cancertype_all = ' ' then 0 else 1 end) as onc_diagnosis,
+/*max(case when dx1 in ('M25511','M25512') then 1
+when dx2 in ('M25511','M25512') then 1
+when dx3 in ('M25511','M25512') then 1 else 0 end) as shoulder_pain_flag,
+max(case when proc1 in ('97161','97162','97163') then 1 else 0 end) as EC_Billed,*/
+sum(a.pay) AS pay
+FROM sandbox.vbc_truven_lr_proc_all a
+WHERE a.memberid in (SELECT DISTINCT memberid FROM sandbox.vbc_truven_lr_tmp_PT_Eps) 
+     AND (proc1 IN (SELECT DISTINCT proc1
+				FROM sandbox.vbc_lr_surg)
+	  OR proc1 IN ('29105', '29125','29126','29130','29131','29200','29240','29260','29280','29520','29530','29540','29550','90901','90911','92548','95831','95832',
+'95833','95834','95851','95852','95992','97010','97012','97014','97016','97018','97022','97024','97026','97028','97032','97033','97034','97035','97036','97039',
+'97110','97112','97113','97116','97124','97127','97139','97140','97150','97161','97162','97163','97164','97530','97533','97535','97537','97542','97545','97546',	
+'97597','97598','97602','97605','97606','97750','97755','97760','97761','97763','97799','4018F','G0151','G0157','G0159','G0281','G0282','G0283','G0329','G0451',	
+'S8940','S8948','S8950','S8990','S9117','S9129','S9131','23120','23130','23410','23412','23415','23420','23430','23440','23450','23455','23460','23462','23465','23466',
+'23470','23472','23473','23474','23490','23700','29806','29807','29819','29820','29821','29822','29823','29824','29825','29826','29827','29828'))
+GROUP BY a.memberid,a.svcdate,a.year,age,a.proc1,region,sex,dx1,dx2,dx3,dx4
+) a 
+LEFT JOIN
+(SELECT DISTINCT memberid,svcdate,Pain,d.category,pt_ep_id,pt_ep_start,pt_ep_end 
+ FROM sandbox.vbc_tmp_lr_truven_1 d) b
+ON a.memberid=b.memberid
+/*AND a.dx1=b.dx1
+AND a.dx2=b.dx2
+AND a.dx3=b.dx3*/
+LEFT JOIN sandbox.lr_truven_PT_surg_labels c
+ON a.memberid=c.memberid
+AND a.svcdate=c.start_date 
+GROUP BY a.memberid,a.svcdate,a.year,a.age,a.pay,a.proc1, c.category3,region,sex, a.dx1,a.dx2,a.dx3,a.dx4
+
+--10.) Label which episode each CPT belongs to 
+
+SELECT *
+     ,CASE WHEN pt_ep_id IS NULL THEN 
+	 (
+	 SELECT TOP 1 inner_table2.pt_ep_id
+            FROM sandbox.vbc_tmp_lr_truven_2 as inner_table2
+            WHERE
+                    inner_table2.memberid = sandbox.vbc_tmp_lr_truven_2.memberid
+                AND inner_table2.svcdate <= sandbox.vbc_tmp_lr_truven_2.svcdate
+                AND inner_table2.pt_ep_id IS NOT NULL
+            ORDER BY
+                inner_table2.svcdate DESC
+        )
+    ELSE pt_ep_id
+    END as episode
+	INTO #vbc_temp
+    FROM sandbox.vbc_tmp_lr_truven_2
+
+
+--10b.) Final table 
+SELECT DISTINCT a.memberid,a.svcdate,a.year,a.age, epi_totpay,a.region,a.sex
+,b.category,b.pain,b.episode, category3 as Surg_desc,a.pt_ep_start,b.distinct_episode as episodeid
+,CASE WHEN category3 IS NULL
+THEN CONCAT(a.memberid,a.svcdate) ELSE NULL 
+END AS visitid
+INTO sandbox.vbc_lr_final
+FROM
+sandbox.vbc_tmp_lr_truven_2 a INNER JOIN
+(
+	SELECT a.*,
+	CASE WHEN a.distinct_episode=b.distinct_episode THEN b.category 
+	ELSE 'Review' end as category,
+	CASE WHEN a.distinct_episode=b.distinct_episode THEN pain_ep  
+	END AS pain
+	FROM
+	(SELECT DISTINCT memberid,svcdate,episode, concat(memberid,episode) AS distinct_episode from #vbc_temp2 WHERE episode IS NOT NULL) a 
+	LEFT JOIN
+	(SELECT DISTINCT category,pain_ep,concat(memberid,episode) as distinct_episode
+	FROM #vbc_temp2 a 
+	WHERE category is not null
+	)b 
+	on a.distinct_episode=b.distinct_episode
+)b
+ON a.memberid=b.memberid
+and a.svcdate=b.svcdate
+LEFT JOIN (SELECT memberid, episode,pt_ep_id, proc1, pay, SUM(pay) OVER (PARTITION BY memberid, episode) as epi_totpay
+			FROM #vbc_temp2) e
+ON a.memberid=e.memberid
+AND a.pt_ep_id=e.pt_ep_id
+AND a.proc1=e.proc1
+
+----------------------------------------------------
+|/*Final Calculations*/|
+----------------------------------------------------
+SELECT avg(epi_totpay)
+FROM sandbox.vbc_lr_final
+
+SELECT AVG(visit_count)
+FROM SELECT 
+(
+COUNT(visitid) OVER(PARTITION BY episodeid) as visit_count
+FROM sandbox.vbc_lr_final
+) visits
+
+
