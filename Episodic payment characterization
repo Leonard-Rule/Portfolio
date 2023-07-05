@@ -1,12 +1,16 @@
-Three initial Criteria to group members into one of three epiosde start types. 
---2.) Members who had a PT evaluation claim during this time frame
-DROP TABLE sandbox.vbc_truven_lr_tmp_PT_Eps
+Goal: Categorize claims data into physical therapy episodes.
+Three criteria were used to group members into epiosdes.
+SQL skills utilized: CASE WHEN statemtns, JOIN, UNION, Window functions (LAG, PARTITION BY, ROW_NUMBER), subqueries
+
+--1.) Create patient universe: All patients who had a PT evaluation claim during this time frame.
+
 SELECT DISTINCT memberid,svcdate,dx1,dx2,dx3,dx4,proc1,year,age,pay,region,sex 
 INTO sandbox.vbc_truven_lr_tmp_PT_Eps 
 FROM sandbox.vbc_truven_lr_proc_all  
 WHERE proc1 in ('97161','97162','97163')
 
---3.) Members who had shoulder surgeries during this time frame
+--2.) Identify members who had surgeries that would signifcantly affect their physical therapy care during this time frame.
+
 SELECT DISTINCT memberid,svcdate,year,age,sum(pay) as pay,dx1,dx2,dx3,dx4,proc1,Category3,short,long,region,sex
 INTO vbc_lr_surg 
 FROM vbc_truven_lr_proc_all a 
@@ -28,7 +32,8 @@ WHERE proc1 in (SELECT CodeValue
 								FROM sandbox.vbc_truven_lr_tmp_PT_Eps) 
 GROUP BY memberid,svcdate,year,age,dx1,dx2,dx3,dx4,proc1,Category3,short,long,region,sex
 
---4.) Create third table that includes any gaps between non-eval PT visits of 90 days or more
+--3.) Identify 90 day gap or more between non-evaluation PT visits.
+
  SELECT DISTINCT memberid,svcdate,year,age,sum(pay) as pay,dx1,dx2,dx3,dx4,proc1,category,region
  INTO sandbox.vbc_caregap
  FROM 
@@ -48,26 +53,43 @@ GROUP BY memberid,svcdate,year,age,dx1,dx2,dx3,dx4,proc1,region
 WHERE Category = 'GAP'
 GROUP BY memberid,svcdate,year,age,dx1,dx2,dx3,dx4,proc1,category,region
 
- Assign type of pain to possible episode start dates that are on the same day. Also, calculate lag and lead days between possible episode start dates.
-DROP TABLE #truven_PT_lead_lag
+--4.) Combine three initial tables. This is a table of all possible episode start dates that includes a label of what type of episode it is.
+
+SELECT a.*
+INTO sandbox.vbc_lr_all 
+FROM
+(
+SELECT DISTINCT 'Evaluation Code' as Category,memberid,svcdate,year,age,pay,dx1,dx2,dx3,dx4,proc1,region
+FROM sandbox.vbc_truven_lr_tmp_PT_Eps
+UNION ALL
+SELECT DISTINCT 'Surgery Code' as Category,memberid,svcdate,year,age,pay,dx1,dx2,dx3,dx4,proc1,region
+FROM sandbox.vbc_lr_surg
+UNION ALL
+SELECT DISTINCT 'Gap' as Category,memberid,svcdate,year,age,pay,dx1,dx2,dx3,dx4,proc1,region
+	FROM sandbox.vbc_caregap
+)a
+
+ --5.) Assign type of pain to possible episode start dates that are on the same day. Also, calculate lag and lead days between possible episode start dates.
+
 SELECT DISTINCT 
 category,memberid,proc1,pay,start_date as start_date, dx1,dx2,dx3,dx4, region,
-CASE WHEN pain IS NULL THEN (SELECT TOP 1 paintable.pain 
-							FROM #vbc_pain_cat AS paintable
-							WHERE paintable.memberid=#vbc_pain_cat.memberid
-							AND paintable.start_date >= (#vbc_pain_cat.start_date) 
-							AND paintable.start_date <= DATEADD(day,30,#vbc_pain_cat.start_date) --Searches for pain dx 30 days ahead of current date to catch more. 
-							AND paintable.pain IS NOT NULL
-							ORDER BY paintable.memberid, paintable.start_date, paintable.pain DESC)
-	ELSE pain
-	END AS Pain,
+CASE WHEN pain IS NULL THEN 
+	(SELECT TOP 1 paintable.pain 
+	 FROM #vbc_pain_cat AS paintable
+	 WHERE paintable.memberid=#vbc_pain_cat.memberid
+	 AND paintable.start_date >= (#vbc_pain_cat.start_date) 
+	 AND paintable.start_date <= DATEADD(day,30,#vbc_pain_cat.start_date) --Searches for pain dx 30 days ahead of current date to catch more. 
+	 AND paintable.pain IS NOT NULL
+	 ORDER BY paintable.memberid, paintable.start_date, paintable.pain DESC)
+ ELSE pain
+END AS Pain,
 datediff(day,lag(start_date,1) OVER (PARTITION BY memberid ORDER BY start_date, category ASC),start_date) AS PT_lag,
 datediff(day, start_date,lead(start_date,1) OVER (PARTITION BY memberid ORDER BY start_date)) AS PT_lead
 INTO #truven_PT_lead_lag
 FROM #vbc_pain_cat
 GROUP BY category,memberid,proc1,pay,start_date, dx1, dx2, dx3,dx4, pain,region
 
---7.)Select proper start date based of epsiode triggering criteria and use that as episode start date (start here on MON)
+--6.)Select proper start date based of epsiode triggering criteria and use that as episode start date (start here on MON)
 DROP TABLE #truven_PT_episodes_begin
 SELECT DISTINCT category,memberid,proc1,pay,start_date, pain, region,
 MAX(PT_lag) AS PT_lag, 
